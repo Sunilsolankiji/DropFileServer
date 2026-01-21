@@ -2,6 +2,8 @@ import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import { v4 as uuidv4 } from 'uuid';
 import os from 'os';
 import dotenv from 'dotenv';
@@ -10,21 +12,45 @@ dotenv.config();
 
 const app = express();
 const server = http.createServer(app);
+
+// Configuration from environment
 const PORT = process.env.PORT || 3001;
 const NODE_ENV = process.env.NODE_ENV || 'development';
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000', 'http://localhost:9002', 'https://sunilsolankiji.github.io/DropFile'];
+const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE) || 100 * 1024 * 1024; // 100MB
+const FILE_TTL_MS = parseInt(process.env.FILE_TTL_MS) || 15 * 60 * 1000; // 15 minutes
+const CLEANUP_INTERVAL = parseInt(process.env.CLEANUP_INTERVAL) || 30000; // 30 seconds
+const MAX_FILES_PER_ROOM = parseInt(process.env.MAX_FILES_PER_ROOM) || 50;
+const INACTIVE_TIMEOUT = parseInt(process.env.INACTIVE_TIMEOUT) || 30000; // 30 seconds
+
+// CORS configuration
+const corsOptions = {
+  origin: NODE_ENV === 'development' ? '*' : ALLOWED_ORIGINS,
+  methods: ['GET', 'POST']
+};
 
 // Configure Socket.IO with CORS
 const io = new Server(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  },
+  cors: corsOptions,
   transports: ['websocket'], // Use websocket only to prevent duplicate connections from transport upgrade
-  maxHttpBufferSize: 1e8 // 100MB for file transfers
+  maxHttpBufferSize: MAX_FILE_SIZE
 });
 
+// Security middleware
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' }
+}));
+
+// Rate limiting for API endpoints
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  message: { error: 'Too many requests, please try again later.' }
+});
+app.use('/api/', apiLimiter);
+
 // Middleware
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
@@ -33,10 +59,97 @@ const peers = new Map(); // socketId -> peer info
 const files = new Map(); // fileId -> file info
 const rooms = new Map(); // roomCode -> array of peers
 
-// Constants
-const FILE_TTL_MS = 15 * 60 * 1000; // 15 minutes
-const PEER_HEARTBEAT_INTERVAL = 5000; // 5 seconds
-const CLEANUP_INTERVAL = 30000; // 30 seconds
+// Socket rate limiting map
+const socketRateLimits = new Map(); // socketId -> { count, resetTime }
+const SOCKET_RATE_LIMIT = 30; // Max events per second
+const SOCKET_RATE_WINDOW = 1000; // 1 second
+
+// ============================================
+// HELPER FUNCTIONS
+// ============================================
+
+/**
+ * Log with timestamp and level
+ */
+function log(level, message, data = {}) {
+  const timestamp = new Date().toISOString();
+  const dataStr = Object.keys(data).length ? ` ${JSON.stringify(data)}` : '';
+  console.log(`[${timestamp}] [${level.toUpperCase()}] ${message}${dataStr}`);
+}
+
+/**
+ * Validate room code format
+ */
+function isValidRoomCode(roomCode) {
+  if (!roomCode || typeof roomCode !== 'string') return false;
+  // Allow alphanumeric, hyphens, underscores, 3-50 chars
+  return /^[a-zA-Z0-9_-]{3,50}$/.test(roomCode);
+}
+
+/**
+ * Validate peer name
+ */
+function isValidPeerName(name) {
+  if (!name || typeof name !== 'string') return false;
+  // Allow reasonable peer names, 1-50 chars, no script injection
+  return name.length >= 1 && name.length <= 50 && !/<[^>]*>/.test(name);
+}
+
+/**
+ * Validate file data
+ */
+function isValidFile(file) {
+  if (!file || typeof file !== 'object') return false;
+  if (!file.name || typeof file.name !== 'string' || file.name.length > 255) return false;
+  if (typeof file.size !== 'number' || file.size <= 0 || file.size > MAX_FILE_SIZE) return false;
+  if (!file.data || typeof file.data !== 'string') return false;
+  return true;
+}
+
+/**
+ * Check socket rate limit
+ */
+function checkSocketRateLimit(socketId) {
+  const now = Date.now();
+  let rateInfo = socketRateLimits.get(socketId);
+
+  if (!rateInfo || now > rateInfo.resetTime) {
+    rateInfo = { count: 0, resetTime: now + SOCKET_RATE_WINDOW };
+    socketRateLimits.set(socketId, rateInfo);
+  }
+
+  rateInfo.count++;
+  return rateInfo.count <= SOCKET_RATE_LIMIT;
+}
+
+/**
+ * Safe callback wrapper
+ */
+function safeCallback(callback, response) {
+  if (typeof callback === 'function') {
+    try {
+      callback(response);
+    } catch (err) {
+      log('error', 'Callback error', { error: err.message });
+    }
+  }
+}
+
+/**
+ * Map file to response (excludes file data)
+ */
+function mapFileToResponse(file) {
+  return {
+    id: file.id,
+    name: file.name,
+    size: file.size,
+    type: file.type,
+    peerId: file.peerId,
+    peerName: file.peerName,
+    expiresAt: file.expiresAt,
+    uploadedAt: file.uploadedAt
+  };
+}
 
 /**
  * Get local IP address
@@ -60,40 +173,44 @@ const LOCAL_IP = getLocalIP();
  * Initialize Socket.IO connection handlers
  */
 io.on('connection', (socket) => {
-  console.log(`[${new Date().toISOString()}] Peer connected: ${socket.id}`);
+  log('info', 'Peer connected', { socketId: socket.id });
 
   /**
    * Peer joins a room with unique identifier
    */
   socket.on('join-room', ({ roomCode, peerName, peerId }, callback) => {
     try {
+      // Rate limit check
+      if (!checkSocketRateLimit(socket.id)) {
+        return safeCallback(callback, { success: false, error: 'Rate limit exceeded' });
+      }
+
+      // Input validation
+      if (!isValidRoomCode(roomCode)) {
+        return safeCallback(callback, { success: false, error: 'Invalid room code format' });
+      }
+      if (peerName && !isValidPeerName(peerName)) {
+        return safeCallback(callback, { success: false, error: 'Invalid peer name' });
+      }
+      if (!peerId || typeof peerId !== 'string') {
+        return safeCallback(callback, { success: false, error: 'Invalid peer ID' });
+      }
+
       // Check if this socket is already registered (prevent duplicate join-room calls)
       if (peers.has(socket.id)) {
         const existingPeer = peers.get(socket.id);
-        console.log(`[WARN] Socket ${socket.id} already joined as ${existingPeer.name}, ignoring duplicate join-room`);
+        log('warn', 'Duplicate join-room attempt', { socketId: socket.id, existingName: existingPeer.name });
 
         const roomPeers = rooms.get(roomCode) || [];
         const otherPeers = roomPeers.filter(p => p.socketId !== socket.id);
         const roomFiles = Array.from(files.values()).filter(f => f.roomCode === roomCode);
 
-        callback({
+        return safeCallback(callback, {
           success: true,
           peers: otherPeers,
-          files: roomFiles.map(f => ({
-            id: f.id,
-            name: f.name,
-            size: f.size,
-            type: f.type,
-            peerId: f.peerId,
-            peerName: f.peerName,
-            expiresAt: f.expiresAt
-          })),
-          serverInfo: {
-            ip: LOCAL_IP,
-            port: PORT
-          }
+          files: roomFiles.map(mapFileToResponse),
+          serverInfo: { ip: LOCAL_IP, port: PORT }
         });
-        return;
       }
 
       socket.join(roomCode);
@@ -103,10 +220,11 @@ io.on('connection', (socket) => {
         rooms.set(roomCode, []);
       }
 
+      const sanitizedName = peerName ? peerName.trim().substring(0, 50) : `Device ${peerId.slice(0, 6)}`;
       const peerInfo = {
         id: peerId,
         socketId: socket.id,
-        name: peerName || `Device ${peerId.slice(0, 6)}`,
+        name: sanitizedName,
         joinedAt: Date.now(),
         lastSeen: Date.now(),
         ip: socket.handshake.address,
@@ -143,31 +261,22 @@ io.on('connection', (socket) => {
       const otherPeers = roomPeers.filter(p => p.socketId !== socket.id);
       const roomFiles = Array.from(files.values()).filter(f => f.roomCode === roomCode);
 
-      callback({
+      safeCallback(callback, {
         success: true,
         peers: otherPeers,
-        files: roomFiles.map(f => ({
-          id: f.id,
-          name: f.name,
-          size: f.size,
-          type: f.type,
-          peerId: f.peerId,
-          peerName: f.peerName,
-          expiresAt: f.expiresAt
-        })),
-        serverInfo: {
-          ip: LOCAL_IP,
-          port: PORT
-        }
+        files: roomFiles.map(mapFileToResponse),
+        serverInfo: { ip: LOCAL_IP, port: PORT }
       });
 
-      console.log(`${peerInfo.name} joined room ${roomCode} (isNew: ${isNewPeer}, roomPeers: ${roomPeers.length}, totalPeers: ${peers.size})`);
-    } catch (error) {
-      console.error('Error in join-room:', error);
-      callback({
-        success: false,
-        error: error.message
+      log('info', 'Peer joined room', {
+        name: peerInfo.name,
+        roomCode,
+        isNew: isNewPeer,
+        roomPeers: roomPeers.length
       });
+    } catch (error) {
+      log('error', 'Error in join-room', { error: error.message });
+      safeCallback(callback, { success: false, error: error.message });
     }
   });
 
@@ -176,49 +285,53 @@ io.on('connection', (socket) => {
    */
   socket.on('add-file', ({ roomCode, file, peerId, peerName }, callback) => {
     try {
+      // Rate limit check
+      if (!checkSocketRateLimit(socket.id)) {
+        return safeCallback(callback, { success: false, error: 'Rate limit exceeded' });
+      }
+
+      // Input validation
+      if (!isValidRoomCode(roomCode)) {
+        return safeCallback(callback, { success: false, error: 'Invalid room code' });
+      }
+      if (!isValidFile(file)) {
+        return safeCallback(callback, { success: false, error: 'Invalid file data or file too large' });
+      }
+
+      // Check room file limit
+      const roomFiles = Array.from(files.values()).filter(f => f.roomCode === roomCode);
+      if (roomFiles.length >= MAX_FILES_PER_ROOM) {
+        return safeCallback(callback, { success: false, error: `Room file limit (${MAX_FILES_PER_ROOM}) reached` });
+      }
+
       const fileId = file.id || uuidv4();
       const expiresAt = Date.now() + FILE_TTL_MS;
 
       const fileData = {
         id: fileId,
-        name: file.name,
+        name: file.name.substring(0, 255), // Sanitize filename length
         size: file.size,
-        type: file.type,
+        type: file.type || 'application/octet-stream',
         peerId,
-        peerName,
+        peerName: peerName?.substring(0, 50) || 'Unknown',
         roomCode,
         expiresAt,
         data: file.data, // Base64 encoded
-        uploadedAt: Date.now()
+        uploadedAt: Date.now(),
+        ownerSocketId: socket.id // Track ownership for authorization
       };
 
       files.set(fileId, fileData);
 
       // Broadcast file metadata to all peers in room
-      io.to(roomCode).emit('file-added', {
-        id: fileId,
-        name: file.name,
-        size: file.size,
-        type: file.type,
-        peerId,
-        peerName,
-        expiresAt,
-        uploadedAt: fileData.uploadedAt
-      });
+      io.to(roomCode).emit('file-added', mapFileToResponse(fileData));
 
-      callback({
-        success: true,
-        fileId,
-        expiresAt
-      });
+      safeCallback(callback, { success: true, fileId, expiresAt });
 
-      console.log(`File added: ${file.name} (${fileId}) by ${peerName}`);
+      log('info', 'File added', { fileName: file.name, fileId, peerName, roomCode });
     } catch (error) {
-      console.error('Error in add-file:', error);
-      callback({
-        success: false,
-        error: error.message
-      });
+      log('error', 'Error in add-file', { error: error.message });
+      safeCallback(callback, { success: false, error: error.message });
     }
   });
 
@@ -227,28 +340,25 @@ io.on('connection', (socket) => {
    */
   socket.on('download-file', ({ fileId }, callback) => {
     try {
+      // Rate limit check
+      if (!checkSocketRateLimit(socket.id)) {
+        return safeCallback(callback, { success: false, error: 'Rate limit exceeded' });
+      }
+
       const file = files.get(fileId);
 
       if (!file) {
-        callback({
-          success: false,
-          error: 'File not found or expired'
-        });
-        return;
+        return safeCallback(callback, { success: false, error: 'File not found or expired' });
       }
 
       // Check if file is expired
       if (file.expiresAt < Date.now()) {
         files.delete(fileId);
-        callback({
-          success: false,
-          error: 'File has expired'
-        });
-        return;
+        return safeCallback(callback, { success: false, error: 'File has expired' });
       }
 
       // Send file data
-      callback({
+      safeCallback(callback, {
         success: true,
         file: {
           id: file.id,
@@ -259,13 +369,10 @@ io.on('connection', (socket) => {
         }
       });
 
-      console.log(`File downloaded: ${file.name} (${fileId})`);
+      log('info', 'File downloaded', { fileName: file.name, fileId });
     } catch (error) {
-      console.error('Error in download-file:', error);
-      callback({
-        success: false,
-        error: error.message
-      });
+      log('error', 'Error in download-file', { error: error.message });
+      safeCallback(callback, { success: false, error: error.message });
     }
   });
 
@@ -274,33 +381,42 @@ io.on('connection', (socket) => {
    */
   socket.on('remove-file', ({ fileId, roomCode }, callback) => {
     try {
+      // Rate limit check
+      if (!checkSocketRateLimit(socket.id)) {
+        return safeCallback(callback, { success: false, error: 'Rate limit exceeded' });
+      }
+
       const file = files.get(fileId);
 
-      if (file && file.roomCode === roomCode) {
-        files.delete(fileId);
-        io.to(roomCode).emit('file-removed', { fileId });
-
-        callback({ success: true });
-        console.log(`File removed: ${fileId}`);
-      } else {
-        callback({
-          success: false,
-          error: 'File not found'
-        });
+      if (!file) {
+        return safeCallback(callback, { success: false, error: 'File not found' });
       }
+
+      if (file.roomCode !== roomCode) {
+        return safeCallback(callback, { success: false, error: 'File not in this room' });
+      }
+
+      // Authorization: Only file owner can delete
+      const peer = peers.get(socket.id);
+      if (file.peerId !== peer?.id && file.ownerSocketId !== socket.id) {
+        return safeCallback(callback, { success: false, error: 'Unauthorized: Only file owner can remove' });
+      }
+
+      files.delete(fileId);
+      io.to(roomCode).emit('file-removed', { fileId });
+
+      safeCallback(callback, { success: true });
+      log('info', 'File removed', { fileId, roomCode });
     } catch (error) {
-      console.error('Error in remove-file:', error);
-      callback({
-        success: false,
-        error: error.message
-      });
+      log('error', 'Error in remove-file', { error: error.message });
+      safeCallback(callback, { success: false, error: error.message });
     }
   });
 
   /**
    * Peer sends heartbeat to stay active
    */
-  socket.on('heartbeat', ({ peerId, roomCode }) => {
+  socket.on('heartbeat', ({ roomCode }) => {
     const peerInfo = peers.get(socket.id);
     if (peerInfo) {
       peerInfo.lastSeen = Date.now();
@@ -323,6 +439,9 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     const peerInfo = peers.get(socket.id);
 
+    // Clean up rate limit tracking
+    socketRateLimits.delete(socket.id);
+
     if (peerInfo) {
       const { roomCode, name, id } = peerInfo;
       const roomPeers = rooms.get(roomCode);
@@ -336,7 +455,7 @@ io.on('connection', (socket) => {
         // Clean up room if empty
         if (roomPeers.length === 0) {
           rooms.delete(roomCode);
-          console.log(`Room ${roomCode} cleaned up (empty)`);
+          log('info', 'Room cleaned up (empty)', { roomCode });
         }
       }
 
@@ -344,7 +463,7 @@ io.on('connection', (socket) => {
       io.to(roomCode).emit('peer-left', { peerId: id });
       peers.delete(socket.id);
 
-      console.log(`${name} disconnected from room ${roomCode}`);
+      log('info', 'Peer disconnected', { name, roomCode });
     }
   });
 });
@@ -353,18 +472,22 @@ io.on('connection', (socket) => {
  * Cleanup expired files every 30 seconds
  */
 setInterval(() => {
-  const now = Date.now();
-  let cleaned = 0;
+  try {
+    const now = Date.now();
+    let cleaned = 0;
 
-  for (const [fileId, file] of files) {
-    if (file.expiresAt < now) {
-      files.delete(fileId);
-      cleaned++;
+    for (const [fileId, file] of files) {
+      if (file.expiresAt < now) {
+        files.delete(fileId);
+        cleaned++;
+      }
     }
-  }
 
-  if (cleaned > 0) {
-    console.log(`[Cleanup] Removed ${cleaned} expired files`);
+    if (cleaned > 0) {
+      log('info', 'Cleanup: Removed expired files', { count: cleaned });
+    }
+  } catch (error) {
+    log('error', 'Cleanup error (files)', { error: error.message });
   }
 }, CLEANUP_INTERVAL);
 
@@ -372,28 +495,32 @@ setInterval(() => {
  * Cleanup inactive peers every 30 seconds
  */
 setInterval(() => {
-  const now = Date.now();
-  const INACTIVE_TIMEOUT = 30000; // 30 seconds
+  try {
+    const now = Date.now();
 
-  for (const [socketId, peerInfo] of peers) {
-    if (now - peerInfo.lastSeen > INACTIVE_TIMEOUT) {
-      // Remove from roomPeers array
-      const roomPeers = rooms.get(peerInfo.roomCode);
-      if (roomPeers) {
-        const index = roomPeers.findIndex(p => p.socketId === socketId);
-        if (index > -1) {
-          roomPeers.splice(index, 1);
+    for (const [socketId, peerInfo] of peers) {
+      if (now - peerInfo.lastSeen > INACTIVE_TIMEOUT) {
+        // Remove from roomPeers array
+        const roomPeers = rooms.get(peerInfo.roomCode);
+        if (roomPeers) {
+          const index = roomPeers.findIndex(p => p.socketId === socketId);
+          if (index > -1) {
+            roomPeers.splice(index, 1);
+          }
+          // Clean up empty rooms
+          if (roomPeers.length === 0) {
+            rooms.delete(peerInfo.roomCode);
+          }
         }
-        // Clean up empty rooms
-        if (roomPeers.length === 0) {
-          rooms.delete(peerInfo.roomCode);
-        }
+
+        io.to(peerInfo.roomCode).emit('peer-left', { peerId: peerInfo.id });
+        peers.delete(socketId);
+        socketRateLimits.delete(socketId);
+        log('info', 'Cleanup: Removed inactive peer', { name: peerInfo.name });
       }
-
-      io.to(peerInfo.roomCode).emit('peer-left', { peerId: peerInfo.id });
-      peers.delete(socketId);
-      console.log(`[Cleanup] Removed inactive peer: ${peerInfo.name}`);
     }
+  } catch (error) {
+    log('error', 'Cleanup error (peers)', { error: error.message });
   }
 }, CLEANUP_INTERVAL);
 
@@ -403,12 +530,24 @@ setInterval(() => {
 
 // Health check
 app.get('/health', (req, res) => {
+  const memoryUsage = process.memoryUsage();
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
     environment: NODE_ENV,
     ip: LOCAL_IP,
-    port: PORT
+    port: PORT,
+    uptime: Math.floor(process.uptime()),
+    memory: {
+      heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)}MB`,
+      heapTotal: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)}MB`,
+      rss: `${Math.round(memoryUsage.rss / 1024 / 1024)}MB`
+    },
+    stats: {
+      peers: peers.size,
+      files: files.size,
+      rooms: rooms.size
+    }
   });
 });
 
@@ -429,25 +568,21 @@ app.get('/api/server-info', (req, res) => {
 // Get room info
 app.get('/api/rooms/:roomCode', (req, res) => {
   const { roomCode } = req.params;
+
+  // Validate room code
+  if (!isValidRoomCode(roomCode)) {
+    return res.status(400).json({ error: 'Invalid room code format' });
+  }
+
   const roomPeers = rooms.get(roomCode);
 
   if (!roomPeers) {
-    return res.status(404).json({
-      error: 'Room not found'
-    });
+    return res.status(404).json({ error: 'Room not found' });
   }
 
   const roomFiles = Array.from(files.values())
     .filter(f => f.roomCode === roomCode)
-    .map(f => ({
-      id: f.id,
-      name: f.name,
-      size: f.size,
-      type: f.type,
-      peerId: f.peerId,
-      peerName: f.peerName,
-      expiresAt: f.expiresAt
-    }));
+    .map(mapFileToResponse);
 
   res.json({
     roomCode,
@@ -495,19 +630,24 @@ server.listen(PORT, '0.0.0.0', () => {
 });
 
 // Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('\nShutting down server...');
-  server.close(() => {
-    console.log('Server stopped');
-    process.exit(0);
-  });
-});
+function gracefulShutdown(signal) {
+  log('info', `Shutting down server (${signal})...`);
 
-process.on('SIGTERM', () => {
-  console.log('\nShutting down server (SIGTERM)...');
+  // Close all socket connections
+  io.close();
+
   server.close(() => {
-    console.log('Server stopped');
+    log('info', 'Server stopped gracefully');
     process.exit(0);
   });
-});
+
+  // Force exit after 10 seconds if graceful shutdown fails
+  setTimeout(() => {
+    log('warn', 'Forcing shutdown after timeout');
+    process.exit(1);
+  }, 10000);
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 

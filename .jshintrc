@@ -1,0 +1,10 @@
+{
+  "esversion": 11,
+  "module": true,
+  "node": true,
+  "strict": false,
+  "undef": true,
+  "unused": "vars",
+  "maxerr": 50
+}
+
