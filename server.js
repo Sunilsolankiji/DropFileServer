@@ -58,6 +58,7 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 const peers = new Map(); // socketId -> peer info
 const files = new Map(); // fileId -> file info
 const rooms = new Map(); // roomCode -> array of peers
+const roomTexts = new Map(); // roomCode -> array of text message info
 
 // Socket rate limiting map
 const socketRateLimits = new Map(); // socketId -> { count, resetTime }
@@ -104,6 +105,43 @@ function isValidFile(file) {
   if (typeof file.size !== 'number' || file.size <= 0 || file.size > MAX_FILE_SIZE) return false;
   if (!file.data || typeof file.data !== 'string') return false;
   return true;
+}
+
+/**
+ * Validate text message payload
+ */
+function isValidTextMessage(message) {
+  if (!message || typeof message !== 'object') return false;
+  if (message.peerName && !isValidPeerName(message.peerName)) return false;
+
+  const messageText = typeof message.text === 'string'
+    ? message.text
+    : typeof message.message === 'string'
+      ? message.message
+      : null;
+
+  if (messageText === null) return false;
+
+  const trimmedText = messageText.trim();
+  return trimmedText.length >= 1 && trimmedText.length <= 2000;
+}
+
+/**
+ * Map text message to response
+ */
+function mapTextToResponse(message) {
+  return {
+    id: message.id,
+    text: message.text,
+    message: message.message,
+    peerId: message.peerId,
+    peerName: message.peerName,
+    createdAt: message.createdAt
+  };
+}
+
+function getRoomTexts(roomCode) {
+  return roomTexts.get(roomCode) || [];
 }
 
 /**
@@ -204,11 +242,16 @@ io.on('connection', (socket) => {
         const roomPeers = rooms.get(roomCode) || [];
         const otherPeers = roomPeers.filter(p => p.socketId !== socket.id);
         const roomFiles = Array.from(files.values()).filter(f => f.roomCode === roomCode);
+        const texts = getRoomTexts(roomCode)
+          .slice()
+          .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+          .map(mapTextToResponse);
 
         return safeCallback(callback, {
           success: true,
           peers: otherPeers,
           files: roomFiles.map(mapFileToResponse),
+          texts,
           serverInfo: { ip: LOCAL_IP, port: PORT }
         });
       }
@@ -218,6 +261,9 @@ io.on('connection', (socket) => {
       // Initialize room if it doesn't exist
       if (!rooms.has(roomCode)) {
         rooms.set(roomCode, []);
+      }
+      if (!roomTexts.has(roomCode)) {
+        roomTexts.set(roomCode, []);
       }
 
       const sanitizedName = peerName ? peerName.trim().substring(0, 50) : `Device ${peerId.slice(0, 6)}`;
@@ -260,11 +306,16 @@ io.on('connection', (socket) => {
       // Send existing peers and files to the new joiner
       const otherPeers = roomPeers.filter(p => p.socketId !== socket.id);
       const roomFiles = Array.from(files.values()).filter(f => f.roomCode === roomCode);
+      const texts = getRoomTexts(roomCode)
+        .slice()
+        .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+        .map(mapTextToResponse);
 
       safeCallback(callback, {
         success: true,
         peers: otherPeers,
         files: roomFiles.map(mapFileToResponse),
+        texts,
         serverInfo: { ip: LOCAL_IP, port: PORT }
       });
 
@@ -331,6 +382,116 @@ io.on('connection', (socket) => {
       log('info', 'File added', { fileName: file.name, fileId, peerName, roomCode });
     } catch (error) {
       log('error', 'Error in add-file', { error: error.message });
+      safeCallback(callback, { success: false, error: error.message });
+    }
+  });
+
+  /**
+   * Peer adds a text message to a room
+   */
+  socket.on('add-text', ({ roomCode, text }, callback) => {
+    try {
+      if (!checkSocketRateLimit(socket.id)) {
+        return safeCallback(callback, { success: false, error: 'Rate limit exceeded' });
+      }
+
+      if (!isValidRoomCode(roomCode)) {
+        return safeCallback(callback, { success: false, error: 'Invalid room code' });
+      }
+      if (!isValidTextMessage(text)) {
+        return safeCallback(callback, { success: false, error: 'Invalid text message' });
+      }
+
+      const roomPeers = rooms.get(roomCode);
+      if (!roomPeers) {
+        return safeCallback(callback, { success: false, error: 'Room not found' });
+      }
+
+      const currentPeer = peers.get(socket.id);
+      if (!currentPeer || currentPeer.roomCode !== roomCode || currentPeer.id !== text.peerId) {
+        return safeCallback(callback, { success: false, error: 'Peer not registered in this room' });
+      }
+
+      const messageContent = typeof text.text === 'string' ? text.text : text.message;
+
+      const message = {
+        id: typeof text.id === 'string' && text.id ? text.id : uuidv4(),
+        roomCode,
+        text: messageContent.trim(),
+        message: messageContent.trim(),
+        peerId: currentPeer.id,
+        peerName: currentPeer.name,
+        createdAt: text.createdAt && !Number.isNaN(Date.parse(text.createdAt))
+          ? text.createdAt
+          : new Date().toISOString(),
+        ownerSocketId: socket.id
+      };
+
+      const messages = getRoomTexts(roomCode);
+      messages.push(message);
+      roomTexts.set(roomCode, messages);
+
+      socket.to(roomCode).emit('text-added', mapTextToResponse(message));
+
+      safeCallback(callback, {
+        success: true,
+        message: mapTextToResponse(message)
+      });
+
+      log('info', 'Text added', { messageId: message.id, peerName: message.peerName, roomCode });
+    } catch (error) {
+      log('error', 'Error in add-text', { error: error.message });
+      safeCallback(callback, { success: false, error: error.message });
+    }
+  });
+
+  socket.on('update-peer-name', ({ roomCode, peerId, peerName }, callback) => {
+    try {
+      if (!checkSocketRateLimit(socket.id)) {
+        return safeCallback(callback, { success: false, error: 'Rate limit exceeded' });
+      }
+      if (!isValidRoomCode(roomCode)) {
+        return safeCallback(callback, { success: false, error: 'Invalid room code' });
+      }
+      if (!peerId || typeof peerId !== 'string') {
+        return safeCallback(callback, { success: false, error: 'Invalid peer ID' });
+      }
+      if (!isValidPeerName(peerName)) {
+        return safeCallback(callback, { success: false, error: 'Invalid peer name' });
+      }
+
+      const currentPeer = peers.get(socket.id);
+      if (!currentPeer || currentPeer.roomCode !== roomCode || currentPeer.id !== peerId) {
+        return safeCallback(callback, { success: false, error: 'Peer not registered in this room' });
+      }
+
+      const roomPeers = rooms.get(roomCode);
+      if (!roomPeers) {
+        return safeCallback(callback, { success: false, error: 'Room not found' });
+      }
+
+      const updatedName = peerName.trim().substring(0, 50);
+      currentPeer.name = updatedName;
+      currentPeer.lastSeen = Date.now();
+
+      const peerIndex = roomPeers.findIndex(peer => peer.id === peerId);
+      if (peerIndex === -1) {
+        return safeCallback(callback, { success: false, error: 'Peer not found in room' });
+      }
+
+      roomPeers[peerIndex] = {
+        ...roomPeers[peerIndex],
+        name: updatedName,
+        lastSeen: currentPeer.lastSeen
+      };
+
+      const updatedPeer = roomPeers[peerIndex];
+      io.to(roomCode).emit('peer-updated', updatedPeer);
+
+      safeCallback(callback, { success: true, peer: updatedPeer });
+      log('info', 'Peer name updated', { peerId, peerName: updatedName, roomCode });
+    } catch (error) {
+      log('error', 'Error in update-peer-name', { error: error.message });
       safeCallback(callback, { success: false, error: error.message });
     }
   });
@@ -455,6 +616,7 @@ io.on('connection', (socket) => {
         // Clean up room if empty
         if (roomPeers.length === 0) {
           rooms.delete(roomCode);
+          roomTexts.delete(roomCode);
           log('info', 'Room cleaned up (empty)', { roomCode });
         }
       }
@@ -510,6 +672,7 @@ setInterval(() => {
           // Clean up empty rooms
           if (roomPeers.length === 0) {
             rooms.delete(peerInfo.roomCode);
+            roomTexts.delete(peerInfo.roomCode);
           }
         }
 
@@ -583,11 +746,16 @@ app.get('/api/rooms/:roomCode', (req, res) => {
   const roomFiles = Array.from(files.values())
     .filter(f => f.roomCode === roomCode)
     .map(mapFileToResponse);
+  const texts = getRoomTexts(roomCode)
+    .slice()
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+    .map(mapTextToResponse);
 
   res.json({
     roomCode,
     peers: roomPeers,
     files: roomFiles,
+    texts,
     timestamp: new Date().toISOString()
   });
 });
@@ -650,4 +818,3 @@ function gracefulShutdown(signal) {
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-
