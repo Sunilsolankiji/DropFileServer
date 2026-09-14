@@ -4,13 +4,12 @@ Backend server for cross-device file sharing over local network/WiFi.
 
 ## Features
 
-- ✅ Real-time file sharing across multiple devices on same network
-- ✅ Automatic file expiration (15 minutes)
-- ✅ Socket.IO for reliable WebSocket communication
-- ✅ REST API for server health checks
-- ✅ Automatic cleanup of expired files and inactive peers
+- ✅ Real-time room presence and text sharing over Socket.IO
+- ✅ Large-file sharing with chunk relay instead of base64 whole-file storage
+- ✅ Resumable online-only transfers with sender/receiver progress tracking
+- ✅ HTTP chunk upload/download endpoints with bounded in-memory buffering
+- ✅ Automatic cleanup of expired transfers, files, and inactive peers
 - ✅ Multi-room support
-- ✅ Base64 file encoding for easy transfer
 
 ## Installation
 
@@ -20,38 +19,51 @@ npm install
 
 ## Setup
 
-1. Create `.env` file (optional, defaults are provided):
+Create `.env` if needed:
 
 ```env
 PORT=3001
 NODE_ENV=development
-```
-
-2. Install dependencies:
-
-```bash
-npm install
+MAX_FILE_SIZE=1073741824
+CHUNK_SIZE=1048576
+MAX_CHUNK_SIZE=4194304
+MAX_INFLIGHT_CHUNKS=8
+MAX_TRANSFER_BUFFER_BYTES=67108864
+FILE_TTL_MS=3600000
 ```
 
 ## Running
 
-### Development (with auto-reload):
+### Development
 ```bash
 npm run dev
 ```
 
-### Production:
+### Production
 ```bash
 npm start
 ```
 
-## Server API
+## Transfer architecture
 
-### Socket.IO Events
+Files are now represented as **share metadata + transfer session state**.
 
-#### Client → Server
+1. Sender joins a room.
+2. Sender emits `add-file` with file metadata only.
+3. Server creates a transfer session and broadcasts a file/share entry.
+4. Receiver emits `start-transfer`.
+5. Sender uploads numbered chunks to `POST /api/transfers/:transferId/chunks/:chunkIndex`.
+6. Receiver fetches available chunks from `GET /api/transfers/:transferId/chunks/:chunkIndex`.
+7. Receiver acknowledges chunks over Socket.IO with `ack-transfer-chunk`.
+8. Server keeps only a bounded chunk window in memory and never stores the whole file payload.
 
-- **join-room**: Join a sharing room
+This implementation is **online-only**. If the sender disconnects or the transfer expires, the transfer is cancelled.
+
+## Socket.IO API
+
+### Client → Server
+
+- **join-room**
   ```javascript
   socket.emit('join-room', {
     roomCode: 'ABC123',
@@ -60,159 +72,142 @@ npm start
   }, callback)
   ```
 
-- **add-file**: Add a file to share
+- **add-file**  
+  Announces a share and creates a transfer session.
   ```javascript
   socket.emit('add-file', {
     roomCode: 'ABC123',
+    peerId: 'peer_xxx',
     file: {
       id: 'file_xxx',
-      name: 'document.pdf',
-      size: 1024000,
-      type: 'application/pdf',
-      data: 'base64_encoded_file_data'
-    },
-    peerId: 'peer_xxx',
-    peerName: 'My Device'
+      name: 'video.mp4',
+      size: 73400320,
+      type: 'video/mp4',
+      chunkSize: 1048576,
+      totalChunks: 70,
+      hash: 'optional-whole-file-hash'
+    }
   }, callback)
   ```
 
-- **download-file**: Download a file
+- **start-transfer**
   ```javascript
-  socket.emit('download-file', {
-    fileId: 'file_xxx'
-  }, callback)
-  ```
-
-- **remove-file**: Remove a shared file
-  ```javascript
-  socket.emit('remove-file', {
+  socket.emit('start-transfer', {
+    roomCode: 'ABC123',
     fileId: 'file_xxx',
-    roomCode: 'ABC123'
+    peerId: 'receiver_peer'
   }, callback)
   ```
 
-- **heartbeat**: Send heartbeat (to keep connection alive)
+- **get-transfer-state**
   ```javascript
-  socket.emit('heartbeat', {
+  socket.emit('get-transfer-state', {
+    transferId: 'transfer_xxx'
+  }, callback)
+  ```
+
+- **ack-transfer-chunk**
+  ```javascript
+  socket.emit('ack-transfer-chunk', {
+    transferId: 'transfer_xxx',
+    chunkIndex: 4,
+    peerId: 'receiver_peer'
+  }, callback)
+  ```
+
+- **cancel-transfer**
+  ```javascript
+  socket.emit('cancel-transfer', {
+    transferId: 'transfer_xxx',
+    roomCode: 'ABC123',
     peerId: 'peer_xxx',
-    roomCode: 'ABC123'
-  })
+    reason: 'user-cancelled'
+  }, callback)
   ```
 
-#### Server → Client
+- **download-file**  
+  Compatibility lookup that returns metadata and transfer info instead of file bytes.
 
-- **peer-joined**: New peer joined the room
+- **remove-file**
+
+- **add-text**
+
+- **update-peer-name**
+
+- **heartbeat**
+
+### Server → Client
+
+- **peer-joined**
+- **peer-left**
+- **peer-updated**
+- **text-added**
+- **file-added** — share metadata only, no `file.data`
+- **file-removed**
+- **transfer-updated**
   ```javascript
-  socket.on('peer-joined', (peerInfo) => {
-    // peerInfo: { id, name, joinedAt, ip, ... }
+  socket.on('transfer-updated', ({ transferId, fileId, status, chunkIndex, reason }) => {
+    // status: { state, uploadedChunks, acknowledgedChunks, senderConnected, receiverConnected, receiverPeerId }
   })
   ```
+- **transfer-completed**
 
-- **file-added**: New file available in room
-  ```javascript
-  socket.on('file-added', (fileInfo) => {
-    // fileInfo: { id, name, size, type, peerId, peerName, expiresAt }
-  })
-  ```
-
-- **file-removed**: File removed from sharing
-  ```javascript
-  socket.on('file-removed', ({ fileId }) => {
-    // Handle file removal
-  })
-  ```
-
-- **peer-left**: Peer disconnected from room
-  ```javascript
-  socket.on('peer-left', ({ peerId }) => {
-    // Handle peer leaving
-  })
-  ```
-
-### REST API
+## HTTP API
 
 - **GET /health**
-  - Health check endpoint
-  - Returns: `{ status: 'ok', timestamp, environment, ip, port }`
-
 - **GET /api/server-info**
-  - Server information and stats
-  - Returns: `{ ip, port, environment, stats: { totalPeers, totalFiles, totalRooms } }`
-
 - **GET /api/rooms/:roomCode**
-  - Get room information
-  - Returns: `{ roomCode, peers, files, timestamp }`
+- **GET /api/transfers/:transferId**
+- **POST /api/transfers/:transferId/chunks/:chunkIndex**
+  - Headers:
+    - `x-peer-id`: sender peer id
+    - `x-chunk-hash`: optional chunk hash
+  - Body: raw binary chunk
 
-## Architecture
+- **GET /api/transfers/:transferId/chunks/:chunkIndex**
+  - Headers:
+    - `x-peer-id`: receiver peer id
+  - Response: raw binary chunk when available
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  Device A   │     │  Device B   │     │  Device C   │
-│  (Browser)  │     │  (Browser)  │     │  (Browser)  │
-└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
-       │                    │                    │
-       └────────────────────┼────────────────────┘
-                            │
-                      ┌─────▼─────┐
-                      │   Server   │
-                      │ (Node.js)  │
-                      └────────────┘
-```
+## Share object shape
 
-## Data Structures
-
-### Peer
-```javascript
-{
-  id: 'peer_xxx',
-  socketId: 'socket_xxx',
-  name: 'Device Name',
-  joinedAt: timestamp,
-  lastSeen: timestamp,
-  ip: '192.168.x.x',
-  isActive: boolean,
-  roomCode: 'ABC123'
-}
-```
-
-### File
 ```javascript
 {
   id: 'file_xxx',
-  name: 'filename.ext',
-  size: bytes,
-  type: 'mime/type',
+  name: 'video.mp4',
+  size: 73400320,
+  type: 'video/mp4',
   peerId: 'peer_xxx',
-  peerName: 'Device Name',
+  peerName: 'My Device',
   roomCode: 'ABC123',
-  expiresAt: timestamp,
-  data: 'base64_encoded_data',
-  uploadedAt: timestamp
+  transferId: 'transfer_xxx',
+  totalChunks: 70,
+  chunkSize: 1048576,
+  status: 'pending|ready|transferring|completed|cancelled|expired',
+  hash: 'optional-whole-file-hash',
+  expiresAt: 1700000000000,
+  uploadedAt: 1700000000000
 }
 ```
 
-## Performance Notes
+## Operational notes
 
-- Max file size: 100MB (configurable in server.js)
-- File TTL: 15 minutes
-- Peer heartbeat: 5 seconds (auto-removes after 30 seconds inactivity)
-- Cleanup interval: 30 seconds
+- Max file size defaults to **1 GB**
+- Default chunk size is **1 MB**
+- Max chunk size is **4 MB**
+- In-flight chunk window defaults to **8**
+- Per-transfer chunk buffer defaults to **64 MB**
+- Transfer TTL defaults to **60 minutes**
+- Cleanup runs every **30 seconds**
+- Peer inactivity timeout defaults to **30 seconds**
 
-## Debugging
+## Frontend migration notes
 
-Enable verbose logging by setting environment variable:
-```bash
-NODE_ENV=development npm run dev
-```
-
-## Port Forwarding (for internet access)
-
-To access the server outside your local network:
-1. Forward port 3001 on your router
-2. Use your public IP address
-3. Note: This exposes files to the internet - use with caution
+- Remove all paths that expect `file.data` from Socket.IO.
+- Slice uploads in the browser with `File.slice`.
+- Fetch chunks progressively and acknowledge each chunk after local persistence/assembly.
+- Use `get-transfer-state` after reconnect to resume missing chunks.
 
 ## License
 
 MIT
-
