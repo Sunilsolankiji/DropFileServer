@@ -192,7 +192,7 @@ This implementation is **online-only**. If the sender disconnects or the transfe
 
 ## Operational notes
 
-- Max file size defaults to **1 GB**
+- Max file size defaults to **2 GB**
 - Default chunk size is **1 MB**
 - Max chunk size is **4 MB**
 - In-flight chunk window defaults to **8**

@@ -16,7 +16,7 @@ const server = http.createServer(app);
 const PORT = parseInt(process.env.PORT, 10) || 3001;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000', 'http://localhost:9002', 'https://sunilsolankiji.github.io/DropFile'];
-const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE, 10) || 1024 * 1024 * 1024;
+const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE, 10) || 2 * 1024 * 1024 * 1024;
 const FILE_TTL_MS = parseInt(process.env.FILE_TTL_MS, 10) || 60 * 60 * 1000;
 const CLEANUP_INTERVAL = parseInt(process.env.CLEANUP_INTERVAL, 10) || 30000;
 const MAX_FILES_PER_ROOM = parseInt(process.env.MAX_FILES_PER_ROOM, 10) || 50;
@@ -44,11 +44,13 @@ app.use(helmet({
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300,
+  skip: req => req.method === 'OPTIONS' || req.path.startsWith('/api/transfers/') && /\/chunks\/\d+$/.test(req.path),
   message: { error: 'Too many requests, please try again later.' }
 });
-app.use('/api/', apiLimiter);
 
 app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+app.use('/api/', apiLimiter);
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ limit: '2mb', extended: true }));
 app.use('/api/transfers/:transferId/chunks/:chunkIndex', express.raw({
@@ -145,12 +147,20 @@ function safeCallback(callback, response) {
 }
 
 function mapTransferStatus(transfer) {
+  const completedReceiverPeerIds = [];
+  for (const [peerId, acknowledgedChunks] of transfer.chunkStates.acknowledgedByPeer) {
+    if (acknowledgedChunks.size === transfer.totalChunks) {
+      completedReceiverPeerIds.push(peerId);
+    }
+  }
+
   return {
     state: transfer.state,
     uploadedChunks: transfer.chunkStates.uploaded.size,
     acknowledgedChunks: transfer.chunkStates.acknowledged.size,
-    receiverPeerId: transfer.receiverPeerId,
-    receiverConnected: Boolean(transfer.receiverSocketId && peers.has(transfer.receiverSocketId)),
+    activeReceivers: transfer.receivers.size,
+    receiverPeerIds: Array.from(transfer.receivers.keys()),
+    completedReceiverPeerIds,
     senderConnected: Boolean(transfer.senderSocketId && peers.has(transfer.senderSocketId))
   };
 }
@@ -173,9 +183,13 @@ function mapFileToResponse(file) {
     hash: file.hash,
     transfer: file.transferId ? mapTransferStatus(transfers.get(file.transferId) || {
       state: 'expired',
-      chunkStates: { uploaded: new Set(), acknowledged: new Set() },
-      receiverPeerId: null,
-      receiverSocketId: null,
+      chunkStates: {
+        uploaded: new Set(),
+        acknowledged: new Set(),
+        acknowledgedByPeer: new Map(),
+        chunkAcknowledgements: new Map()
+      },
+      receivers: new Map(),
       senderSocketId: null
     }) : undefined
   };
@@ -274,7 +288,6 @@ function cancelTransfer(transfer, reason, notifyRoom = true) {
 
 function completeTransfer(transfer) {
   transfer.state = 'completed';
-  transfer.chunkBuffer.clear();
 
   const file = files.get(transfer.fileId);
   if (file) {
@@ -286,6 +299,45 @@ function completeTransfer(transfer) {
     fileId: transfer.fileId,
     status: mapTransferStatus(transfer)
   });
+}
+
+function removeReceiverFromTransfer(transfer, receiverPeerId, reason, notifyRoom = true) {
+  if (!transfer.receivers.has(receiverPeerId)) {
+    return false;
+  }
+
+  transfer.receivers.delete(receiverPeerId);
+  transfer.chunkStates.acknowledgedByPeer.delete(receiverPeerId);
+
+  for (const [chunkIndex, acknowledgedPeers] of transfer.chunkStates.chunkAcknowledgements) {
+    acknowledgedPeers.delete(receiverPeerId);
+    if (acknowledgedPeers.size === 0) {
+      transfer.chunkStates.chunkAcknowledgements.delete(chunkIndex);
+    }
+    if (acknowledgedPeers.size >= transfer.receivers.size && transfer.chunkStates.uploaded.has(chunkIndex)) {
+      transfer.chunkBuffer.delete(chunkIndex);
+    }
+  }
+
+  transfer.state = transfer.receivers.size > 0 ? 'transferring' : transfer.chunkStates.uploaded.size > 0 ? 'ready' : 'pending';
+  updateTransferTimestamp(transfer);
+
+  const file = files.get(transfer.fileId);
+  if (file) {
+    file.status = transfer.state;
+  }
+
+  if (notifyRoom) {
+    io.to(transfer.roomCode).emit('transfer-updated', {
+      transferId: transfer.id,
+      fileId: transfer.fileId,
+      status: mapTransferStatus(transfer),
+      reason,
+      peerId: receiverPeerId
+    });
+  }
+
+  return true;
 }
 
 function canAcceptChunk(transfer, chunkIndex) {
@@ -367,8 +419,6 @@ function createTransferRecord({ roomCode, file, peer }) {
     senderPeerId: peer.id,
     senderSocketId: peer.socketId,
     senderName: peer.name,
-    receiverPeerId: null,
-    receiverSocketId: null,
     fileName: fileData.name,
     fileSize: fileData.size,
     mimeType: fileData.type,
@@ -381,10 +431,13 @@ function createTransferRecord({ roomCode, file, peer }) {
     expiresAt,
     chunkStates: {
       uploaded: new Set(),
-      acknowledged: new Set()
+      acknowledged: new Set(),
+      acknowledgedByPeer: new Map(),
+      chunkAcknowledgements: new Map()
     },
     chunkBuffer: new Map(),
-    chunkUploaders: new Set()
+    chunkUploaders: new Set(),
+    receivers: new Map()
   };
 
   files.set(fileId, fileData);
@@ -579,13 +632,13 @@ io.on('connection', (socket) => {
       if (transfer.senderPeerId === peer.id) {
         return safeCallback(callback, { success: false, error: 'Sender cannot start download for own file' });
       }
-      if (transfer.receiverPeerId && transfer.receiverPeerId !== peer.id) {
-        return safeCallback(callback, { success: false, error: 'Transfer already reserved by another receiver' });
-      }
-
-      transfer.receiverPeerId = peer.id;
-      transfer.receiverSocketId = socket.id;
-      transfer.state = transfer.chunkStates.uploaded.size > 0 ? 'transferring' : 'ready';
+      transfer.receivers.set(peer.id, {
+        peerId: peer.id,
+        socketId: socket.id,
+        joinedAt: Date.now(),
+        lastSeen: Date.now()
+      });
+      transfer.state = 'transferring';
       updateTransferTimestamp(transfer);
 
       const fileRecord = files.get(fileId);
@@ -608,7 +661,8 @@ io.on('connection', (socket) => {
         state: transfer.state,
         downloadUrlTemplate: `/api/transfers/${transfer.id}/chunks/{chunkIndex}`,
         uploadedChunks: Array.from(transfer.chunkStates.uploaded),
-        acknowledgedChunks: Array.from(transfer.chunkStates.acknowledged)
+        acknowledgedChunks: Array.from(transfer.chunkStates.acknowledged),
+        activeReceivers: transfer.receivers.size
       });
     } catch (error) {
       log('error', 'Error in start-transfer', { error: error.message });
@@ -629,7 +683,7 @@ io.on('connection', (socket) => {
           totalChunks: transfer.totalChunks,
           state: transfer.state,
           roomCode: file.roomCode,
-          startRequired: !transfer.receiverPeerId || transfer.receiverPeerId !== peerId,
+          startRequired: !transfer.receivers.has(peerId),
           downloadUrlTemplate: `/api/transfers/${transfer.id}/chunks/{chunkIndex}`
         }
       });
@@ -670,18 +724,36 @@ io.on('connection', (socket) => {
       const transfer = getTransferOrThrow(transferId);
       const peer = getPeerInRoom(socket, transfer.roomCode, peerId);
 
-      if (transfer.receiverPeerId !== peer.id || transfer.receiverSocketId !== socket.id) {
-        return safeCallback(callback, { success: false, error: 'Only the active receiver can acknowledge chunks' });
-      }
-
       if (!isValidChunkIndex(chunkIndex, transfer.totalChunks)) {
         return safeCallback(callback, { success: false, error: 'Invalid chunk index' });
       }
 
+      const receiver = transfer.receivers.get(peer.id);
+      if (!receiver || receiver.socketId !== socket.id) {
+        return safeCallback(callback, { success: false, error: 'Only the active receiver can acknowledge chunks' });
+      }
+      if (transfer.chunkStates.acknowledgedByPeer.has(peer.id) && transfer.chunkStates.acknowledgedByPeer.get(peer.id).has(chunkIndex)) {
+        return safeCallback(callback, {
+          success: true,
+          state: transfer.state,
+          acknowledgedChunks: transfer.chunkStates.acknowledged.size
+        });
+      }
+
+      const chunkAcknowledgements = transfer.chunkStates.chunkAcknowledgements.get(chunkIndex) || new Set();
+      chunkAcknowledgements.add(peer.id);
+      transfer.chunkStates.chunkAcknowledgements.set(chunkIndex, chunkAcknowledgements);
+
+      const receiverAcknowledgements = transfer.chunkStates.acknowledgedByPeer.get(peer.id) || new Set();
+      receiverAcknowledgements.add(chunkIndex);
+      transfer.chunkStates.acknowledgedByPeer.set(peer.id, receiverAcknowledgements);
+
       transfer.chunkStates.acknowledged.add(chunkIndex);
-      transfer.chunkBuffer.delete(chunkIndex);
-      transfer.chunkStates.uploaded.add(chunkIndex);
-      transfer.state = transfer.chunkStates.acknowledged.size === transfer.totalChunks ? 'completed' : 'transferring';
+      if (chunkAcknowledgements.size >= transfer.receivers.size) {
+        transfer.chunkBuffer.delete(chunkIndex);
+      }
+      const receiverCompleted = receiverAcknowledgements.size === transfer.totalChunks;
+      transfer.state = transfer.receivers.size > 0 ? 'transferring' : transfer.chunkStates.uploaded.size > 0 ? 'ready' : 'pending';
       updateTransferTimestamp(transfer);
 
       io.to(transfer.roomCode).emit('transfer-updated', {
@@ -691,8 +763,15 @@ io.on('connection', (socket) => {
         chunkIndex
       });
 
-      if (transfer.state === 'completed') {
-        completeTransfer(transfer);
+      if (receiverCompleted) {
+        io.to(transfer.roomCode).emit('transfer-completed', {
+          transferId,
+          fileId: transfer.fileId,
+          peerId: peer.id,
+          status: mapTransferStatus(transfer)
+        });
+
+        removeReceiverFromTransfer(transfer, peer.id, 'receiver-completed', false);
       }
 
       safeCallback(callback, {
@@ -719,13 +798,17 @@ io.on('connection', (socket) => {
       const transfer = getTransferOrThrow(transferId);
       const peer = getPeerInRoom(socket, roomCode, peerId);
       const isSender = transfer.senderPeerId === peer.id;
-      const isReceiver = transfer.receiverPeerId === peer.id;
+      const isReceiver = transfer.receivers.has(peer.id);
 
       if (!isSender && !isReceiver) {
         return safeCallback(callback, { success: false, error: 'Unauthorized transfer cancellation' });
       }
 
-      cancelTransfer(transfer, reason || 'cancelled');
+      if (isSender) {
+        cancelTransfer(transfer, reason || 'cancelled');
+      } else {
+        removeReceiverFromTransfer(transfer, peer.id, reason || 'receiver-cancelled');
+      }
       safeCallback(callback, { success: true });
     } catch (error) {
       log('error', 'Error in cancel-transfer', { error: error.message });
@@ -911,17 +994,13 @@ io.on('connection', (socket) => {
       for (const transfer of transfers.values()) {
         if (transfer.senderSocketId === socket.id) {
           cancelTransfer(transfer, 'sender-offline');
-        } else if (transfer.receiverSocketId === socket.id) {
-          transfer.receiverSocketId = null;
-          transfer.receiverPeerId = null;
-          if (transfer.state !== 'completed') {
-            transfer.state = 'pending';
-            io.to(transfer.roomCode).emit('transfer-updated', {
-              transferId: transfer.id,
-              fileId: transfer.fileId,
-              status: mapTransferStatus(transfer),
-              reason: 'receiver-offline'
-            });
+        } else {
+          for (const [receiverPeerId, receiver] of transfer.receivers) {
+            if (receiver.socketId !== socket.id) {
+              continue;
+            }
+            removeReceiverFromTransfer(transfer, receiverPeerId, 'receiver-offline');
+            break;
           }
         }
       }
@@ -968,7 +1047,7 @@ app.post('/api/transfers/:transferId/chunks/:chunkIndex', (req, res) => {
       hash: req.header('x-chunk-hash') || null
     });
     transfer.chunkStates.uploaded.add(chunkIndex);
-    transfer.state = transfer.receiverPeerId ? 'transferring' : 'ready';
+    transfer.state = transfer.receivers.size > 0 ? 'transferring' : 'ready';
     updateTransferTimestamp(transfer);
 
     const file = files.get(transfer.fileId);
@@ -1009,9 +1088,12 @@ app.get('/api/transfers/:transferId/chunks/:chunkIndex', (req, res) => {
     if (!isValidChunkIndex(chunkIndex, transfer.totalChunks)) {
       return res.status(400).json({ error: 'Chunk index out of range' });
     }
-    if (!receiverPeerId || receiverPeerId !== transfer.receiverPeerId) {
-      return res.status(403).json({ error: 'Only the active receiver can fetch chunks' });
+    const receiver = receiverPeerId ? transfer.receivers.get(receiverPeerId) : null;
+    if (!receiver) {
+      return res.status(403).json({ error: 'Only active receivers can fetch chunks' });
     }
+
+    receiver.lastSeen = Date.now();
 
     const chunk = transfer.chunkBuffer.get(chunkIndex);
     if (!chunk) {
@@ -1085,11 +1167,13 @@ setInterval(() => {
         for (const transfer of transfers.values()) {
           if (transfer.senderSocketId === socketId) {
             cancelTransfer(transfer, 'sender-timeout');
-          } else if (transfer.receiverSocketId === socketId) {
-            transfer.receiverSocketId = null;
-            transfer.receiverPeerId = null;
-            if (transfer.state !== 'completed') {
-              transfer.state = 'pending';
+          } else {
+            for (const [receiverPeerId, receiver] of transfer.receivers) {
+              if (receiver.socketId !== socketId) {
+                continue;
+              }
+              removeReceiverFromTransfer(transfer, receiverPeerId, 'receiver-timeout', false);
+              break;
             }
           }
         }
@@ -1186,7 +1270,7 @@ app.get('/api/transfers/:transferId', (req, res) => {
       state: transfer.state,
       roomCode: transfer.roomCode,
       senderPeerId: transfer.senderPeerId,
-      receiverPeerId: transfer.receiverPeerId,
+      receiverPeerIds: Array.from(transfer.receivers.keys()),
       chunkSize: transfer.chunkSize,
       totalChunks: transfer.totalChunks,
       expiresAt: transfer.expiresAt,
