@@ -692,7 +692,9 @@ io.on('connection', (socket) => {
           state: transfer.state,
           roomCode: file.roomCode,
           startRequired: !transfer.receivers.has(peerId),
-          downloadUrlTemplate: `/api/transfers/${transfer.id}/chunks/{chunkIndex}`
+          downloadUrlTemplate: `/api/transfers/${transfer.id}/chunks/{chunkIndex}`,
+          uploadedChunkIndexes: Array.from(transfer.chunkStates.uploaded).sort((a, b) => a - b),
+          acknowledgedChunkIndexes: Array.from(transfer.chunkStates.acknowledged).sort((a, b) => a - b)
         }
       });
     } catch (error) {
@@ -715,7 +717,9 @@ io.on('connection', (socket) => {
         roomCode: transfer.roomCode,
         state: transfer.state,
         chunkSize: transfer.chunkSize,
-        summary: getTransferChunksSummary(transfer)
+        summary: getTransferChunksSummary(transfer),
+        uploadedChunkIndexes: Array.from(transfer.chunkStates.uploaded).sort((a, b) => a - b),
+        acknowledgedChunkIndexes: Array.from(transfer.chunkStates.acknowledged).sort((a, b) => a - b)
       });
     } catch (error) {
       log('error', 'Error in get-transfer-state', { error: error.message });
@@ -1285,7 +1289,9 @@ app.get('/api/transfers/:transferId', (req, res) => {
       chunkSize: transfer.chunkSize,
       totalChunks: transfer.totalChunks,
       expiresAt: transfer.expiresAt,
-      summary: getTransferChunksSummary(transfer)
+      summary: getTransferChunksSummary(transfer),
+      uploadedChunkIndexes: Array.from(transfer.chunkStates.uploaded).sort((a, b) => a - b),
+      acknowledgedChunkIndexes: Array.from(transfer.chunkStates.acknowledged).sort((a, b) => a - b)
     });
   } catch (error) {
     res.status(error.message === 'Transfer not found' ? 404 : 400).json({ error: error.message });
