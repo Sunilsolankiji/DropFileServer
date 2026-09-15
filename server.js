@@ -314,12 +314,18 @@ function removeReceiverFromTransfer(transfer, receiverPeerId, reason, notifyRoom
     if (acknowledgedPeers.size === 0) {
       transfer.chunkStates.chunkAcknowledgements.delete(chunkIndex);
     }
+    if (acknowledgedPeers.size < transfer.receivers.size) {
+      transfer.chunkStates.acknowledged.delete(chunkIndex);
+    }
     if (acknowledgedPeers.size >= transfer.receivers.size && transfer.chunkStates.uploaded.has(chunkIndex)) {
       transfer.chunkBuffer.delete(chunkIndex);
     }
   }
 
   transfer.state = transfer.receivers.size > 0 ? 'transferring' : transfer.chunkStates.uploaded.size > 0 ? 'ready' : 'pending';
+  if (transfer.receivers.size === 0 && transfer.chunkStates.acknowledged.size === transfer.totalChunks) {
+    completeTransfer(transfer);
+  }
   updateTransferTimestamp(transfer);
 
   const file = files.get(transfer.fileId);
@@ -341,10 +347,6 @@ function removeReceiverFromTransfer(transfer, receiverPeerId, reason, notifyRoom
 }
 
 function canAcceptChunk(transfer, chunkIndex) {
-  if (transfer.chunkStates.acknowledged.has(chunkIndex)) {
-    return false;
-  }
-
   if (transfer.chunkBuffer.has(chunkIndex)) {
     return false;
   }
@@ -375,6 +377,9 @@ function getFileOrThrow(fileId) {
   }
   if (file.expiresAt < Date.now()) {
     files.delete(fileId);
+    if (file.transferId) {
+      transfers.delete(file.transferId);
+    }
     throw new Error('File has expired');
   }
   return file;
@@ -660,8 +665,8 @@ io.on('connection', (socket) => {
         totalChunks: transfer.totalChunks,
         state: transfer.state,
         downloadUrlTemplate: `/api/transfers/${transfer.id}/chunks/{chunkIndex}`,
-        uploadedChunks: Array.from(transfer.chunkStates.uploaded),
-        acknowledgedChunks: Array.from(transfer.chunkStates.acknowledged),
+        uploadedChunkIndexes: Array.from(transfer.chunkStates.uploaded).sort((a, b) => a - b),
+        acknowledgedChunkIndexes: Array.from(transfer.chunkStates.acknowledged).sort((a, b) => a - b),
         activeReceivers: transfer.receivers.size
       });
     } catch (error) {
@@ -674,6 +679,9 @@ io.on('connection', (socket) => {
     try {
       const file = getFileOrThrow(fileId);
       const transfer = getTransferOrThrow(file.transferId);
+      if (!peerId || typeof peerId !== 'string') {
+        return safeCallback(callback, { success: false, error: 'Invalid peer ID' });
+      }
       return safeCallback(callback, {
         success: true,
         file: mapFileToResponse(file),
@@ -732,6 +740,9 @@ io.on('connection', (socket) => {
       if (!receiver || receiver.socketId !== socket.id) {
         return safeCallback(callback, { success: false, error: 'Only the active receiver can acknowledge chunks' });
       }
+      if (!transfer.chunkBuffer.has(chunkIndex)) {
+        return safeCallback(callback, { success: false, error: 'Chunk not available yet' });
+      }
       if (transfer.chunkStates.acknowledgedByPeer.has(peer.id) && transfer.chunkStates.acknowledgedByPeer.get(peer.id).has(chunkIndex)) {
         return safeCallback(callback, {
           success: true,
@@ -748,8 +759,8 @@ io.on('connection', (socket) => {
       receiverAcknowledgements.add(chunkIndex);
       transfer.chunkStates.acknowledgedByPeer.set(peer.id, receiverAcknowledgements);
 
-      transfer.chunkStates.acknowledged.add(chunkIndex);
       if (chunkAcknowledgements.size >= transfer.receivers.size) {
+        transfer.chunkStates.acknowledged.add(chunkIndex);
         transfer.chunkBuffer.delete(chunkIndex);
       }
       const receiverCompleted = receiverAcknowledgements.size === transfer.totalChunks;
