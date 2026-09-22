@@ -48,6 +48,21 @@ npm run dev
 npm start
 ```
 
+## Project structure
+
+`server.js` is a thin entry point. Application code is organized under `src/` by responsibility:
+
+```text
+src/
+├── app/              # Express bootstrap, middleware, cleanup, shutdown wiring
+├── config/           # Environment-backed configuration
+├── infrastructure/   # Shared in-memory state
+├── routes/           # HTTP API route modules
+├── services/         # Peer, text, file, and transfer domain logic
+├── sockets/          # Socket.IO registration and event handlers
+└── utils/            # Logging, validation, callbacks, and network helpers
+```
+
 ### Render free deployment
 
 Use a **Web Service** with:
