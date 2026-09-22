@@ -15,7 +15,8 @@ const server = http.createServer(app);
 
 const PORT = parseInt(process.env.PORT, 10) || 3001;
 const NODE_ENV = process.env.NODE_ENV || 'development';
-const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000', 'http://localhost:9002', 'https://sunilsolankiji.github.io/DropFile'];
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS?.split(',').map(origin => origin.trim()).filter(Boolean) || ['http://localhost:3000', 'http://localhost:9002', 'https://sunilsolankiji.github.io'];
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.trim().replace(/\/+$/, '') || '';
 const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE, 10) || 2 * 1024 * 1024 * 1024;
 const FILE_TTL_MS = parseInt(process.env.FILE_TTL_MS, 10) || 60 * 60 * 1000;
 const CLEANUP_INTERVAL = parseInt(process.env.CLEANUP_INTERVAL, 10) || 30000;
@@ -28,12 +29,13 @@ const MAX_TRANSFER_BUFFER_BYTES = parseInt(process.env.MAX_TRANSFER_BUFFER_BYTES
 
 const corsOptions = {
   origin: NODE_ENV === 'development' ? '*' : ALLOWED_ORIGINS,
-  methods: ['GET', 'POST']
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'x-peer-id', 'x-chunk-hash'],
+  exposedHeaders: ['Content-Length', 'X-Chunk-Index', 'X-Chunk-Hash']
 };
 
 const io = new Server(server, {
   cors: corsOptions,
-  transports: ['websocket'],
   maxHttpBufferSize: MAX_CHUNK_SIZE + 64 * 1024
 });
 
@@ -208,6 +210,23 @@ function getLocalIP() {
 }
 
 const LOCAL_IP = getLocalIP();
+
+function getPublicBaseUrl() {
+  return PUBLIC_BASE_URL || `http://${LOCAL_IP}:${PORT}`;
+}
+
+function getTransferChunkUrlTemplate(transferId) {
+  const path = `/api/transfers/${transferId}/chunks/{chunkIndex}`;
+  return PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}${path}` : path;
+}
+
+function getServerInfo() {
+  return {
+    ip: LOCAL_IP,
+    port: PORT,
+    publicBaseUrl: getPublicBaseUrl()
+  };
+}
 
 function getRoomFiles(roomCode) {
   return Array.from(files.values())
@@ -497,7 +516,7 @@ io.on('connection', (socket) => {
           peers: otherPeers,
           files: getRoomFiles(roomCode),
           texts,
-          serverInfo: { ip: LOCAL_IP, port: PORT }
+          serverInfo: getServerInfo()
         });
       }
 
@@ -552,7 +571,7 @@ io.on('connection', (socket) => {
         peers: otherPeers,
         files: getRoomFiles(roomCode),
         texts,
-        serverInfo: { ip: LOCAL_IP, port: PORT }
+        serverInfo: getServerInfo()
       });
 
       log('info', 'Peer joined room', {
@@ -601,7 +620,7 @@ io.on('connection', (socket) => {
         expiresAt: fileData.expiresAt,
         chunkSize: transfer.chunkSize,
         totalChunks: transfer.totalChunks,
-        uploadUrlTemplate: `/api/transfers/${transfer.id}/chunks/{chunkIndex}`
+        uploadUrlTemplate: getTransferChunkUrlTemplate(transfer.id)
       });
 
       log('info', 'Transfer session created', {
@@ -664,7 +683,7 @@ io.on('connection', (socket) => {
         chunkSize: transfer.chunkSize,
         totalChunks: transfer.totalChunks,
         state: transfer.state,
-        downloadUrlTemplate: `/api/transfers/${transfer.id}/chunks/{chunkIndex}`,
+        downloadUrlTemplate: getTransferChunkUrlTemplate(transfer.id),
         uploadedChunkIndexes: Array.from(transfer.chunkStates.uploaded).sort((a, b) => a - b),
         acknowledgedChunkIndexes: Array.from(transfer.chunkStates.acknowledged).sort((a, b) => a - b),
         activeReceivers: transfer.receivers.size
@@ -692,7 +711,7 @@ io.on('connection', (socket) => {
           state: transfer.state,
           roomCode: file.roomCode,
           startRequired: !transfer.receivers.has(peerId),
-          downloadUrlTemplate: `/api/transfers/${transfer.id}/chunks/{chunkIndex}`,
+          downloadUrlTemplate: getTransferChunkUrlTemplate(transfer.id),
           uploadedChunkIndexes: Array.from(transfer.chunkStates.uploaded).sort((a, b) => a - b),
           acknowledgedChunkIndexes: Array.from(transfer.chunkStates.acknowledged).sort((a, b) => a - b)
         }
@@ -1212,6 +1231,7 @@ app.get('/health', (req, res) => {
     environment: NODE_ENV,
     ip: LOCAL_IP,
     port: PORT,
+    publicBaseUrl: getPublicBaseUrl(),
     uptime: Math.floor(process.uptime()),
     memory: {
       heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)}MB`,
@@ -1231,6 +1251,7 @@ app.get('/api/server-info', (req, res) => {
   res.json({
     ip: LOCAL_IP,
     port: PORT,
+    publicBaseUrl: getPublicBaseUrl(),
     environment: NODE_ENV,
     limits: {
       maxFileSize: MAX_FILE_SIZE,

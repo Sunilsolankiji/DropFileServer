@@ -24,6 +24,8 @@ Create `.env` if needed:
 ```env
 PORT=3001
 NODE_ENV=development
+PUBLIC_BASE_URL=http://localhost:3001
+ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173,https://sunilsolankiji.github.io
 MAX_FILE_SIZE=1073741824
 CHUNK_SIZE=1048576
 MAX_CHUNK_SIZE=4194304
@@ -31,6 +33,8 @@ MAX_INFLIGHT_CHUNKS=8
 MAX_TRANSFER_BUFFER_BYTES=67108864
 FILE_TTL_MS=3600000
 ```
+
+`PUBLIC_BASE_URL` must be the public backend origin when the frontend is hosted separately. For Render, set it to your service URL, for example `https://your-dropfile-server.onrender.com`. `ALLOWED_ORIGINS` must contain frontend origins only, without paths; use `https://sunilsolankiji.github.io`, not `https://sunilsolankiji.github.io/DropFile`.
 
 ## Running
 
@@ -43,6 +47,20 @@ npm run dev
 ```bash
 npm start
 ```
+
+### Render free deployment
+
+Use a **Web Service** with:
+
+| Setting | Value |
+|---|---|
+| Build Command | `npm install` |
+| Start Command | `npm start` |
+| `NODE_ENV` | `production` |
+| `PUBLIC_BASE_URL` | `https://<your-render-service>.onrender.com` |
+| `ALLOWED_ORIGINS` | Your frontend origin, for example `https://sunilsolankiji.github.io` |
+
+Render free instances sleep when idle. Because transfers are online-only and kept in memory, an active transfer is lost if the service restarts or sleeps; keep both devices connected while transferring and retry after the service wakes.
 
 ## Transfer architecture
 
